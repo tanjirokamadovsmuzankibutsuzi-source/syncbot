@@ -1,12 +1,15 @@
+
+import time
+
 class UIBuilder:
     @staticmethod
-    def progress_bar(percent, status):
+    def progress_bar(percent, step_name):
         filled = int(percent / 10)
         bar = "▰" * filled + "▱" * (10 - filled)
         return (
             f"⏳ **Task Processing**\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🚀 **Status:** {status}\n"
+            f"🚀 **Status:** {step_name}\n"
             f"{bar} {percent}%\n"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
@@ -23,24 +26,22 @@ class UIBuilder:
         # --- Logic Extraction ---
         d_start = analysis['start']
         d_end = analysis['end']
+        d_mid = analysis['mid']
         drift = d_end - d_start
         
-        # Final Mux Delay = (Internal Delay of Ref) + (Waveform Offset)
-        # Note: New Audio needs to shift relative to Video
-        # If Audio is AHEAD (-ve), we need +ve delay? No.
-        # Delay = Ref_Start - Audio_Start. 
-        # If Waveform says Audio is -500ms (Early), we add 500ms delay?
-        # Standard: Delay = Ref_Internal + (-1 * Waveform_Start)
+        # --- Final Delay Calculation ---
+        # Formula: Ref_Internal + (-1 * Waveform_Offset)
         final_mux_delay = int(ref['internal_delay'] + (-d_start))
 
         # --- FPS Matcher (v6.1 Logic) ---
         raw_ratio = 1.0
         fps_action = ""
         is_fps_issue = False
+        is_cut_issue = analysis['cut_detected']
         
-        if abs(drift) > 100:
+        if abs(drift) > 100 and not is_cut_issue:
             is_fps_issue = True
-            # Ratio = Duration / (Duration - Drift_in_sec)
+            # Ratio Calculation
             raw_ratio = ref['duration'] / (ref['duration'] - (drift/1000))
             
             # Standard Detection
@@ -58,7 +59,15 @@ class UIBuilder:
             
             fps_action = f"1️⃣ **Convert Audio** : `{match_found}`\n"
 
-        # --- HEADER ---
+        # --- STATUS HEADER ---
+        if is_cut_issue:
+            status_header = "❌ **CUT/JUMP DETECTED**"
+        elif is_fps_issue:
+            status_header = "⚠️ **ACTION REQUIRED**"
+        else:
+            status_header = "✅ **PERFECT MATCH**"
+
+        # --- REPORT BUILD ---
         text = (
             f"**MEDIA SYNC REPORT**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -72,16 +81,19 @@ class UIBuilder:
             f"────────────  ────────  ──────────\n"
             f"Video       : {ref['fps_str']:<8}  {ref['internal_delay']}ms\n"
             f"Audio       : {new['fps_str']:<8}  -\n"
-            f"Drift       :           {abs(drift):.0f}ms\n"
+            f"Raw Diff    :           [{abs(drift):.0f}ms]\n"
             f"- - - - - - - - - - - - - - - - - -\n\n"
         )
 
         # --- ANALYSIS ---
         text += "**THREE-POINT ANALYSIS**\n"
         text += f"Delay (Start)  : {d_start:.1f} ms\n"
+        text += f"Delay (Mid)    : {d_mid:.1f} ms\n"
         text += f"Delay (End)    : {d_end:.1f} ms\n"
         
-        if is_fps_issue:
+        if is_cut_issue:
+            text += f"🚨 **Jump Detected** (Midpoint Mismatch)\n"
+        elif is_fps_issue:
             text += f"🚨 **Drift Detected** ({drift:.0f}ms)\n"
         else:
             text += f"✅ **Stable Sync**\n"
@@ -89,14 +101,16 @@ class UIBuilder:
         text += f"- - - - - - - - - - - - - - - - - -\n\n"
 
         # --- ACTION ---
-        text += "**ACTION REQUIRED**\n"
+        text += f"**{status_header}**\n"
         
-        if is_fps_issue:
+        if is_cut_issue:
+            text += "1️⃣ **Manual Fix Required**\n"
+            text += "   Audio has cuts or extra scenes."
+        elif is_fps_issue:
             text += fps_action
             text += f"2️⃣ **Fix Drift** : `atempo={raw_ratio:.6f}`\n"
             text += f"3️⃣ **Final Mux** : `Delay {int(-d_start)} ms`"
         else:
-            text += f"**PERFECT MATCH**\n"
             text += f"1️⃣ **Add Delay** : `{final_mux_delay} ms`\n"
             text += f"2️⃣ **Mux Directly**"
 
