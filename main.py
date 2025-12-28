@@ -1,3 +1,4 @@
+
 import logging
 import asyncio
 import time
@@ -19,25 +20,28 @@ ui = UIBuilder()
 
 def parse_link(arg):
     """
-    Splits Link and Track ID.
-    Input: "link:2" -> ("link", 2)
-    Input: "link" -> ("link", 0)
+    Smart Link Parser:
+    1. Tracks ID (link:2)
+    2. GDrive Conversion (auto-detect)
     """
     track = 0
     link = arg
-    # Check for track syntax
+    
+    # 1. Track ID Extraction
     if re.search(r':\d+$', arg):
         parts = arg.rsplit(':', 1)
         link = parts[0]
         track = int(parts[1])
     
-    # GDrive Conversion
-    if "drive.google.com" in link:
-        # Extract ID
-        match = re.search(r"(?:/d/|id=|file/d/)([a-zA-Z0-9_-]+)", link)
-        if match:
-            link = f"{INDEX_WORKER}/direct.aspx?id={match.group(1)}"
-            
+    # 2. GDrive Converter
+    # Agar link GDrive ka hai (view, open, id, etc)
+    gdrive_pattern = r"(?:/d/|id=|file/d/)([a-zA-Z0-9_-]+)"
+    match = re.search(gdrive_pattern, link)
+    
+    if match and "drive.google.com" in link:
+        # Convert to Index Worker
+        link = f"{INDEX_WORKER}/direct.aspx?id={match.group(1)}"
+        
     return link, track
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -47,20 +51,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/asc video_link audio_link`\n"
         "`/asc video_link:1 audio_link:0` (With Track IDs)\n\n"
         "⚡ **Features:**\n"
-        "• Internal Delay Detection\n"
-        "• 3-Point Drift Check\n"
+        "• Internal Delay (v6.1)\n"
+        "• 3-Point Check (Start/Mid/End)\n"
         "• Auto GDrive Conversion"
     )
 
 async def asc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if user.id != OWNER_ID: return
+    if user.id != OWNER_ID: 
+        await update.message.reply_text("🔒 Access Denied.")
+        return
 
     if len(context.args) < 2:
         await update.message.reply_text("❌ Usage: `/asc video audio`")
         return
 
-    # Random Task ID
     task_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
     
     msg = await update.message.reply_text(
@@ -73,72 +78,84 @@ async def asc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_time = time.time()
 
     try:
-        # 1. Parse Inputs
+        # 1. Parse Links & Tracks
         ref_link, ref_track = parse_link(context.args[0])
         new_link, new_track = parse_link(context.args[1])
 
-        # 2. Metadata (v6.1 Logic)
-        await msg.edit_text(ui.progress_bar(15, "Reading Metadata (Internal Delay)..."))
+        # 2. Metadata (Internal Delay & FPS)
+        await msg.edit_text(ui.progress_bar(15, "Reading Metadata..."))
         
-        ref_meta = engine.get_metadata(ref_link, f"0:v:0") # Video info
+        # Video stream info try karo pehle
+        ref_meta = engine.get_metadata(ref_link, f"0:v:0") 
         if not ref_meta:
-            # Fallback to audio stream if video stream missing info
+            # Fallback to audio stream if no video
             ref_meta = engine.get_metadata(ref_link, f"0:a:{ref_track}")
             
         new_meta = engine.get_metadata(new_link, f"0:a:{new_track}")
 
         if not ref_meta or not new_meta:
-            await msg.edit_text("❌ Metadata Failed. Links check karein.")
+            await msg.edit_text(f"❌ Metadata Failed.\n\nChecked Link: `{ref_link}`")
             return
 
-        # 3. Extraction (Start & End)
+        # 3. Extraction (Start, Mid, End)
         duration = min(ref_meta['duration'], new_meta['duration'])
         
-        # Paths
-        r_start = engine.work_dir / f"r_s_{task_id}.wav"
-        n_start = engine.work_dir / f"n_s_{task_id}.wav"
-        r_end = engine.work_dir / f"r_e_{task_id}.wav"
-        n_end = engine.work_dir / f"n_e_{task_id}.wav"
-
-        await msg.edit_text(ui.progress_bar(40, "Streaming Samples..."))
+        # Points define karo
+        points = {
+            "start": 0,
+            "mid": duration / 2,
+            "end": duration - 30
+        }
         
-        loop = asyncio.get_event_loop()
+        files = {}
         tasks = []
+        loop = asyncio.get_event_loop()
+
+        await msg.edit_text(ui.progress_bar(40, "Streaming Samples (Start/Mid/End)..."))
         
-        # Start Sample (0s)
-        tasks.append(loop.run_in_executor(None, engine.extract_sample, ref_link, 0, r_start, ref_track))
-        tasks.append(loop.run_in_executor(None, engine.extract_sample, new_link, 0, n_start, new_track))
-        
-        # End Sample (Last 30s) if file long enough
-        check_drift = False
-        if duration > 120:
-            check_drift = True
-            end_seek = duration - 30
-            tasks.append(loop.run_in_executor(None, engine.extract_sample, ref_link, end_seek, r_end, ref_track))
-            tasks.append(loop.run_in_executor(None, engine.extract_sample, new_link, end_seek, n_end, new_track))
+        for key, seek in points.items():
+            # Skip Mid/End if file is short (< 2 min)
+            if duration < 120 and key != "start": continue
+
+            r_f = engine.work_dir / f"r_{key}_{task_id}.wav"
+            n_f = engine.work_dir / f"n_{key}_{task_id}.wav"
+            files[key] = (r_f, n_f)
+            
+            # Extract Async
+            tasks.append(loop.run_in_executor(None, engine.extract_sample, ref_link, seek, r_f, ref_track))
+            tasks.append(loop.run_in_executor(None, engine.extract_sample, new_link, seek, n_f, new_track))
         
         await asyncio.gather(*tasks)
 
         # 4. Calculation
         await msg.edit_text(ui.progress_bar(80, "Running Cross-Correlation..."))
         
-        d_start = engine.calculate_offset(r_start, n_start)
-        d_end = 0.0
+        delays = {}
+        for key, (r_f, n_f) in files.items():
+            delay = engine.calculate_offset(r_f, n_f)
+            delays[key] = delay if delay is not None else 0.0
+
+        # 5. Smart Logic (Cut vs Drift)
+        d_start = delays.get('start', 0.0)
+        d_mid = delays.get('mid', d_start)
+        d_end = delays.get('end', d_start)
         
-        if check_drift:
-            res_end = engine.calculate_offset(r_end, n_end)
-            d_end = res_end if res_end is not None else d_start
-        else:
-            d_end = d_start
+        drift_total = d_end - d_start
+        cut_detected = False
+        
+        # Cut Logic: Agar Drift linear nahi hai
+        if abs(drift_total) > 100:
+            expected_mid = d_start + (drift_total / 2)
+            # Tolerance 200ms
+            if abs(d_mid - expected_mid) > 200:
+                cut_detected = True
 
-        if d_start is None:
-            await msg.edit_text("❌ Correlation Failed (Silence/No Audio).")
-            return
-
-        # 5. Report
+        # 6. Report Generation
         analysis = {
             'start': d_start,
-            'end': d_end
+            'mid': d_mid,
+            'end': d_end,
+            'cut_detected': cut_detected
         }
         
         report = ui.generate_report(ref_meta, new_meta, analysis, user.first_name, time.time() - start_time)
@@ -146,7 +163,7 @@ async def asc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Error: {e}")
-        await msg.edit_text(f"❌ Critical Error: {e}")
+        await msg.edit_text(f"❌ Error: {e}")
     
     finally:
         engine.cleanup()
